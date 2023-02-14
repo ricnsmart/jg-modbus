@@ -243,7 +243,7 @@ func (c *conn) serve() {
 			buf = buf[:l]
 
 			if c.server.logLevel == DEBUG {
-				log.Printf("DEBUG % x\n", buf)
+				log.Printf("DEBUG Read: % x\n", buf)
 			}
 
 			upCh <- buf
@@ -287,7 +287,7 @@ func (c *conn) write(buf []byte) error {
 	defer c.rwc.SetReadDeadline(time.Time{})
 
 	if c.server.logLevel == DEBUG {
-		log.Printf("DEBUG % x\n", buf)
+		log.Printf("DEBUG write: % x\n", buf)
 	}
 
 	if _, err := c.rwc.Write(buf); err != nil {
