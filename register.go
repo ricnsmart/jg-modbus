@@ -46,12 +46,11 @@ func (p ReadRegisters) Decode(data []byte) map[string]any {
 	return m
 }
 
-func (p ReadRegisters) NewReadRegisters(function uint8, address []byte) ([][]byte, error) {
-	cmd := make([][]byte, 0)
+func (p ReadRegisters) NewReadRegisters(function uint8, address []byte) (fs []*Frame) {
 	for _, field := range p {
 		f := Frame{Function: function, Address: address}
 		f.SetData(crcSetData(field.Addr()))
-		cmd = append(cmd, f.Bytes())
+		fs = append(fs, &f)
 	}
-	return cmd, nil
+	return fs
 }

@@ -1,8 +1,6 @@
 package modbus
 
 import (
-	"context"
-	"errors"
 	"log"
 	"net"
 	"sync"
@@ -25,20 +23,14 @@ type Handler func(addr net.Addr, data []byte, answer func(payload []byte) error)
 type Server struct {
 	addr string
 
-	handle Handler
-
 	readTimeout time.Duration
 
 	writeTimeout time.Duration
 
-	// 存储连接
-	// 用于主动关闭连接
-	connMap sync.Map
-
 	// 设备上报数据，server一次读取多少个字节
 	readSize int
 
-	onConnClose func(addr net.Addr)
+	serve func(conn *Conn)
 
 	logLevel ErrorLevel
 }
@@ -49,14 +41,17 @@ var DefaultWriteTimeout = 90 * time.Second
 
 var DefaultMaxReadSize = 512
 
-func NewServer(addr string, handle Handler) *Server {
+func NewServer(addr string) *Server {
 	return &Server{
 		addr:         addr,
-		handle:       handle,
 		readTimeout:  DefaultReadTimeout,
 		writeTimeout: DefaultWriteTimeout,
 		readSize:     DefaultMaxReadSize,
 	}
+}
+
+func (s *Server) SetServe(serve func(conn *Conn)) {
+	s.serve = serve
 }
 
 func (s *Server) SetReadTimeout(t time.Duration) {
@@ -69,10 +64,6 @@ func (s *Server) SetWriteTimeout(t time.Duration) {
 
 func (s *Server) SetMaxReadSize(size int) {
 	s.readSize = size
-}
-
-func (s *Server) SetOnConnClose(f func(addr net.Addr)) {
-	s.onConnClose = f
 }
 
 func (s *Server) SetLogLevel(logLevel ErrorLevel) {
@@ -93,99 +84,11 @@ func (s *Server) ListenAndServe() error {
 			return err
 		}
 
-		go s.newConn(rwc).serve()
+		go s.serve(&Conn{rwc: rwc, server: s})
 	}
 }
 
-func (s *Server) CloseConn(addr any) error {
-	v, ok := s.connMap.Load(addr)
-	if !ok {
-		return errors.New("connection not found")
-	}
-	return v.(*conn).rwc.Close()
-}
-
-func (s *Server) DownloadCommandToAll(ctx context.Context, cmd []byte, callback func(addr any, err error)) {
-
-	s.connMap.Range(func(key, value any) bool {
-		conn := value.(*conn)
-
-		conn.mu.Lock()
-		defer conn.mu.Unlock()
-
-		select {
-		case <-conn.ctx.Done():
-			callback(key, errors.New("connection closed"))
-			return false
-		case <-ctx.Done():
-			callback(key, errors.New("download closed"))
-			return false
-		case conn.downCh <- cmd:
-
-		}
-
-		select {
-		case <-conn.ctx.Done():
-			callback(key, errors.New("connection closed"))
-		case <-ctx.Done():
-			callback(key, errors.New("response timeout"))
-		case <-conn.respCh:
-
-		}
-		return false
-	})
-
-}
-
-func (s *Server) DownloadCommand(ctx context.Context, addr any, cmd []byte) ([]byte, error) {
-	c, ok := s.connMap.Load(addr)
-	if !ok {
-		return nil, errors.New("connection not found")
-	}
-
-	conn := c.(*conn)
-
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-
-	select {
-	case <-conn.ctx.Done():
-		return nil, errors.New("connection closed")
-	case <-ctx.Done():
-		return nil, errors.New("download timeout")
-	case conn.downCh <- cmd:
-
-	}
-
-	select {
-	case <-conn.ctx.Done():
-		return nil, errors.New("connection closed")
-	case <-ctx.Done():
-		return nil, errors.New("response timeout")
-	case resp := <-conn.respCh:
-		return resp, nil
-	}
-}
-
-func (s *Server) newConn(rwc net.Conn) *conn {
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c := &conn{
-		server: s,
-		rwc:    rwc,
-		downCh: make(chan []byte),
-		respCh: make(chan []byte),
-		ctx:    ctx,
-		cancel: cancel,
-	}
-
-	s.connMap.Store(rwc.RemoteAddr(), c)
-
-	return c
-}
-
-type conn struct {
+type Conn struct {
 	// server is the server on which the connection arrived.
 	// Immutable; never nil.
 	server *Server
@@ -196,103 +99,76 @@ type conn struct {
 	// *tls.conn.
 	rwc net.Conn
 
-	// downCh 用户向设备下发的数据
-	downCh chan []byte
-
-	// respCh 用于存放下发后设备的响应
-	respCh chan []byte
-
-	// 控制连接的关闭
-	ctx context.Context
-
-	cancel context.CancelFunc
-
-	// 控制写入频率
 	mu sync.Mutex
 }
 
-func (c *conn) serve() {
-
-	// upCh 设备上发的数据
-	upCh := make(chan []byte)
-	defer close(upCh)
-
-	// 设备离线
-	// 同时这也是判断设备是否在线的依据
-	defer func() {
-		c.server.onConnClose(c.rwc.RemoteAddr())
-		c.server.connMap.Delete(c.rwc)
-		c.rwc.Close()
-	}()
-
-	go func() {
-		for {
-			_ = c.rwc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
-
-			buf := make([]byte, c.server.readSize)
-
-			l, err := c.rwc.Read(buf)
-			if err != nil {
-				if c.server.logLevel >= ERROR {
-					log.Printf("ERROR %v\n", err)
-				}
-				c.cancel()
-				return
-			}
-
-			buf = buf[:l]
-
-			if c.server.logLevel == DEBUG {
-				log.Printf("DEBUG %v Read: % x\n", c.rwc.RemoteAddr(), buf)
-			}
-
-			upCh <- buf
-			_ = c.rwc.SetReadDeadline(time.Time{})
-		}
-	}()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case packet := <-upCh:
-			go c.server.handle(c.rwc.RemoteAddr(), packet, func(payload []byte) error {
-				if err := c.write(payload); err != nil {
-					c.cancel()
-					return err
-				}
-				return nil
-			})
-		case payload := <-c.downCh:
-			if err := c.write(payload); err != nil {
-				c.cancel()
-				return
-			}
-			ticker := time.NewTicker(c.server.readTimeout)
-
-			select {
-			case <-ticker.C:
-			case data := <-upCh:
-				// 可能错误的接收心跳包，需校验
-				c.respCh <- data
-			}
-			ticker.Stop()
-		}
-	}
-}
-
-func (c *conn) write(buf []byte) error {
-	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
+func (c *Conn) Read() ([]byte, error) {
+	_ = c.rwc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
 
 	defer c.rwc.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, c.server.readSize)
+
+	l, err := c.rwc.Read(buf)
+	if err != nil {
+		if c.server.logLevel >= ERROR {
+			log.Printf("ERROR %v Read %v\n", c.rwc.RemoteAddr(), err)
+		}
+		return nil, err
+	}
+
+	if c.server.logLevel == DEBUG {
+		log.Printf("DEBUG %v Read: % x\n", c.rwc.RemoteAddr(), buf[:l])
+	}
+
+	return buf[:l], nil
+}
+
+func (c *Conn) Write(buf []byte) error {
+	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
+
+	defer c.rwc.SetWriteDeadline(time.Time{})
 
 	if c.server.logLevel == DEBUG {
 		log.Printf("DEBUG %v write: % x\n", c.rwc.RemoteAddr(), buf)
 	}
 
-	if _, err := c.rwc.Write(buf); err != nil {
-		return err
+	_, err := c.rwc.Write(buf)
+
+	return err
+}
+
+func (c *Conn) Close() error {
+	return c.rwc.Close()
+}
+
+func (c *Conn) Addr() net.Addr {
+	return c.rwc.RemoteAddr()
+}
+
+func (c *Conn) Lock() {
+	c.mu.Lock()
+}
+
+func (c *Conn) Unlock() {
+	c.mu.Unlock()
+}
+
+func (c *Conn) NewRequest(frame *Frame) (*Frame, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.Write(frame.Bytes()); err != nil {
+		return nil, err
 	}
 
-	return nil
+	buf, err := c.Read()
+	if err != nil {
+		return nil, err
+	}
+	respFrame, err := NewFrame(buf)
+	if err != nil {
+		return nil, err
+	}
+	return respFrame, nil
 }

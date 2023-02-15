@@ -70,21 +70,19 @@ func crcInitTable() {
 }
 
 func crcGetData(bs []byte) []byte {
-	if bs != nil {
-		for index, data := range bs {
-			bs[index] = data - 0x33
-		}
+	buf := make([]byte, len(bs))
+	copy(buf, bs)
+	for index, data := range buf {
+		buf[index] = data - 0x33
 	}
-
-	return bs
+	return buf
 }
 
 func crcSetData(bs []byte) []byte {
-	if bs != nil {
-		for index, data := range bs {
-			bs[index] = data + 0x33
-		}
+	buf := make([]byte, len(bs))
+	copy(buf, bs)
+	for index, data := range buf {
+		buf[index] = data + 0x33
 	}
-
-	return bs
+	return buf
 }
